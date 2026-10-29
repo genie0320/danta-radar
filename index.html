@@ -775,9 +775,9 @@ function onSelectedTrade(p, qty, side, ts) {
   const val = p * qty;
   state.tape.unshift({ p, qty, side, ts, val });
   if (state.tape.length > 60) state.tape.length = 60;
-  if (!cd.candles.length) return;
   const tfs = state.tf * 60;
   const t = Math.floor((Math.floor(ts / 1000) + KST) / tfs) * tfs;
+  if (!cd.candles.length) cd.candles.push({ time: t, o: p, h: p, l: p, c: p, v: 0 });
   let last = cd.candles[cd.candles.length - 1];
   if (t < last.time) return;
   if (t > last.time) { last = { time: t, o: p, h: p, l: p, c: p, v: 0 }; cd.candles.push(last); if (cd.candles.length > 400) cd.candles.shift(); }
@@ -1074,6 +1074,9 @@ function makeWS(payload, onMsg, onState) {
   open();
   return { close() { closed = true; clearInterval(ping); try { ws.close(); } catch (e) { } } };
 }
+function waitTickers() {
+  return new Promise(r => { const t0 = Date.now(); const iv = setInterval(() => { const n = [...state.markets.values()].filter(m => m.price).length; if (n >= state.markets.size * 0.9 || Date.now() - t0 > 5000) { clearInterval(iv); r(); } }, 200); });
+}
 function liveSource() {
   let main, book;
   const src = {
@@ -1084,10 +1087,13 @@ function liveSource() {
       const krw = all.filter(m => m.market.startsWith('KRW-'));
       for (const m of krw) state.markets.set(m.market, newMarket(m.market, m.korean_name));
       const codes = krw.map(m => m.market);
-      for (let i = 0; i < codes.length; i += 100) {
-        const tk = await rest('/ticker?markets=' + codes.slice(i, i + 100).join(','));
-        for (const t of tk) applyTicker(t);
-      }
+      // Upbit blocks most cross-origin REST calls from web pages; tickers then come from the WebSocket snapshot.
+      try {
+        for (let i = 0; i < codes.length; i += 100) {
+          const tk = await rest('/ticker?markets=' + codes.slice(i, i + 100).join(','));
+          for (const t of tk) applyTicker(t);
+        }
+      } catch (e) { state.restBlocked = true; }
       state.streamStart = Date.now();
       for (const m of state.markets.values()) m.observedSince = state.streamStart;
       main = makeWS([{ ticket: 'dr-' + Math.random().toString(36).slice(2) }, { type: 'ticker', codes }, { type: 'trade', codes }, { format: 'DEFAULT' }],
@@ -1096,7 +1102,7 @@ function liveSource() {
           else if (d.type === 'ticker') applyTicker(Object.assign({ market: d.code }, d));
         },
         (s) => s === 'open' ? setStatus('ok', '실시간 연결됨') : setStatus('err', '재연결 중…'));
-      this.seedHistory(codes);
+      if (state.restBlocked) await waitTickers(); else this.seedHistory(codes);
     },
     async seedHistory() {
       // backfill last ~15 minutes from 1-minute candles for the 60 most active markets
@@ -1117,11 +1123,13 @@ function liveSource() {
       }
     },
     async candles(code, tf) {
-      const cs = await rest(`/candles/minutes/${tf}?market=${code}&count=200`);
+      if (state.restBlocked) return [];
+      const cs = await rest(`/candles/minutes/${tf}?market=${code}&count=200`).catch(() => { state.restBlocked = true; return []; });
       return cs.reverse().map(c => ({ time: Math.floor(Date.parse(c.candle_date_time_utc + 'Z') / 1000) + KST, o: c.opening_price, h: c.high_price, l: c.low_price, c: c.trade_price, v: c.candle_acc_trade_price }));
     },
     async recentTrades(code) {
-      const ts = await rest(`/trades/ticks?market=${code}&count=200`);
+      if (state.restBlocked) return [];
+      const ts = await rest(`/trades/ticks?market=${code}&count=200`).catch(() => []);
       return ts.map(t => ({ p: t.trade_price, qty: t.trade_volume, side: t.ask_bid, ts: t.timestamp, val: t.trade_price * t.trade_volume }));
     },
     subscribeOrderbook(code) {
@@ -1252,6 +1260,7 @@ function demoSource() {
 }
 
 /* ---------------- status / banner ---------------- */
+const LIVE_NOTE = '업비트 <b>실시간 시세</b>입니다. 다만 업비트가 다른 사이트에서의 과거 데이터 요청을 막고 있어, <b>차트와 집계는 이 페이지를 연 시점부터</b> 쌓입니다. 몇 분 지나면 화면이 채워집니다.';
 function setStatus(k, t) { $('status').className = 'status ' + k; $('statusText').textContent = t; }
 function banner(html) { const b = $('banner'); if (!html) { b.hidden = true; return; } b.innerHTML = html; b.hidden = false; }
 
@@ -1264,7 +1273,7 @@ function renderFast() { renderBook(); renderPressure(); renderTape(); renderPosi
 
 async function startSource(mode) {
   if (state.source) state.source.stop();
-  state.mode = mode; state.markets = new Map(); state.tape = []; state.ob = null;
+  state.mode = mode; state.restBlocked = false; state.markets = new Map(); state.tape = []; state.ob = null;
   document.querySelectorAll('#modeSeg button').forEach(b => b.classList.toggle('on', b.dataset.mode === mode));
   buildScales();
   d3.select('#treemap').selectAll('*').remove(); d3.select('#scatter').selectAll('*').remove(); d3.select('#rs').selectAll('*').remove();
@@ -1272,7 +1281,7 @@ async function startSource(mode) {
   state.source = src;
   try {
     await src.start();
-    banner(mode === 'demo' ? '지금은 <b>데모 데이터</b>(가상 시세)를 보여주고 있습니다. 상단에서 <b>실시간</b>을 누르면 업비트 시세로 바뀝니다.' : null);
+    banner(mode === 'demo' ? '지금은 <b>데모 데이터</b>(가상 시세)를 보여주고 있습니다. 상단에서 <b>실시간</b>을 누르면 업비트 시세로 바뀝니다.' : (state.restBlocked ? LIVE_NOTE : null));
   } catch (e) {
     console.warn('live start failed', e);
     if (mode === 'live') {
